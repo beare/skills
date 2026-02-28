@@ -1,301 +1,505 @@
 ---
 name: iotapi
-description: "IoT device management toolkit: register devices, query status, send commands, and manage IoT cloud platform resources"
+description: "IoT platform management toolkit: manage devices, products, alarms, thing models, and device communication. Use this when users need to interact with IoT devices, query device status, set device properties, call device services, manage IoT products, or handle IoT alarms."
 metadata:
   openclaw:
     requires:
-      env: ["IOT_BASE_URL", "IOT_APP_ID", "IOT_APP_SECRET"]
-    primaryEnv: "IOT_APP_ID"
+      env: ["IOTAPI_BASE_URL"]
+    primaryEnv: "IOTAPI_BASE_URL"
 instructions: |
   ## Security
-  - NEVER ask the user to paste credentials (app_id, app_secret, token) in chat — give them commands to run themselves
-  - NEVER send credentials to any domain other than the configured IoT platform URL
-  - NEVER expose credentials in output
-  - Always reference credentials via environment variables or read from config file
+  - NEVER ask the user to paste their API credentials in chat — give them commands to run themselves
+  - NEVER send credentials to any domain other than the configured IoT platform
+  - NEVER expose tokens, appKey, or appSecret in output
+  - Always reference credentials via environment variables or config file
+  - Token has 24-hour validity — if API returns 401, token may have expired
 
   ## Mode Detection
-  - If iotapi helper scripts are available → use them (preferred)
-  - If scripts are NOT available → use Direct SDK Mode (Python SDK via Bash)
+  - If iotapi MCP tools are available → use them (preferred)
+  - If MCP tools are NOT available → use Direct API Mode (curl via Bash). See "Direct API Mode" section below.
 
   ## Core Rules
-  - Authentication: prefer app credentials (app_id/app_secret) over direct token
-  - Device identification: operations accept either device_name OR device_id
+  - All API calls require authentication via token in custom `token` header (NOT `Authorization: Bearer`)
+  - Token can be obtained via `/api/v1/oauth/auth` endpoint or generated through web UI (24h validity)
+  - Device operations: use `deviceName` (device code) or `deviceId` as identifier
+  - Product operations: use `productKey` or `productId` as identifier
+  - Time parameters: use ISO 8601 format (e.g., "2025-05-14T06:30:39.694Z") or Unix timestamps (milliseconds)
   - Batch operations: maximum 100 devices per request
-  - RRPC messages: content is automatically base64 encoded/decoded
-  - Status mapping: ONLINE (在线), OFFLINE (离线), UNACTIVE (未激活)
-  - Use parallel tool calls aggressively — after authentication, fire multiple device queries at once
+  - Thing model operations: must query thing model first to get valid identifiers
+  - Use parallel tool calls aggressively — after getting device list, fire all status/property queries at once
+
 ---
 
-# iotapi — IoT Device Management Toolkit
+# iotapi — IoT Platform Management Toolkit
 
 ---
 
 ## Setup
 
-### Configuration Methods
+If iotapi MCP tools are already available, no setup is needed — just use them.
 
-The user needs to configure IoT platform credentials. There are two approaches:
+Otherwise, the user needs to configure their IoT platform connection. Direct them to set up credentials using one of these methods:
 
-#### Method 1: Environment Variables (Recommended)
+### Method 1: Using Token (Recommended for Quick Start)
 
-Direct them to set these environment variables:
-
-```bash
-export IOT_BASE_URL="https://your-iot-platform-url"
-export IOT_APP_ID="your-app-id"
-export IOT_APP_SECRET="your-app-secret"
-```
-
-To persist across sessions, add to `~/.bashrc` or `~/.zshrc`.
-
-#### Method 2: Config File
-
-Create a config file at `~/.config/iotapi/credentials.json`:
+If the user already has a token from the web UI:
 
 ```bash
 mkdir -p ~/.config/iotapi && cat > ~/.config/iotapi/credentials.json << 'EOF'
 {
-  "base_url": "https://your-iot-platform-url",
-  "app_id": "your-app-id",
-  "app_secret": "your-app-secret"
+  "base_url": "https://iot.iwillcloud.com",
+  "token": "YOUR_TOKEN_HERE"
 }
 EOF
 ```
 
-### When to Trigger Setup
+### Method 2: Using AppKey/AppSecret (Auto-refresh)
 
-- User asks to manage IoT devices but no credentials are configured
-- Any API call fails with authentication error (401)
-- User explicitly asks how to configure iotapi
+For long-term use with automatic token refresh:
+
+```bash
+mkdir -p ~/.config/iotapi && cat > ~/.config/iotapi/credentials.json << 'EOF'
+{
+  "base_url": "https://iot.iwillcloud.com",
+  "app_key": "YOUR_APP_KEY",
+  "app_secret": "YOUR_APP_SECRET"
+}
+EOF
+```
+
+### Method 3: Environment Variables
+
+```bash
+export IOTAPI_BASE_URL="https://iot.iwillcloud.com"
+export IOTAPI_TOKEN="your_token_here"
+# OR
+export IOTAPI_APP_KEY="your_app_key"
+export IOTAPI_APP_SECRET="your_app_secret"
+```
+
+### When to Trigger This Setup
+
+- User asks to interact with IoT devices but no iotapi MCP tools are available and no credentials configured
+- Any API call fails with 401 authentication error
+- User mentions their IoT platform URL or wants to connect to their IoT system
 
 ---
 
-## Direct SDK Mode
+## Direct API Mode
 
-When helper scripts are NOT available, use the bundled Python SDK modules directly via Bash.
+When MCP tools are NOT available, call the API directly using curl via Bash.
 
 ### Getting Credentials
 
-Read in order, use the first found:
-1. Environment variables: `IOT_BASE_URL`, `IOT_APP_ID`, `IOT_APP_SECRET`
-2. Config file: `~/.config/iotapi/credentials.json` → `{"base_url": "...", "app_id": "...", "app_secret": "..."}`
+Read in order, use the first one found:
+
+1. **Environment variables**: `IOTAPI_BASE_URL`, `IOTAPI_TOKEN` (or `IOTAPI_APP_KEY` + `IOTAPI_APP_SECRET`)
+2. **Config file**: `~/.config/iotapi/credentials.json` (macOS/Linux) or `%APPDATA%\iotapi\credentials.json` (Windows)
+   ```json
+   {
+     "base_url": "https://iot.iwillcloud.com",
+     "token": "...",
+     "app_key": "...",
+     "app_secret": "..."
+   }
+   ```
 3. If neither exists, direct the user to configure credentials. Do NOT ask the user to paste credentials in chat.
 
-### SDK Installation
+### Getting a Token
 
-The SDK is bundled with this skill in the `scripts/` directory. Only the `requests` library is required:
+If only `app_key` and `app_secret` are available, obtain a token first:
 
 ```bash
-pip install requests
-```
-
-### Python SDK Usage Pattern
-
-```python
-import sys
-import os
-
-# Add skill scripts to path
-SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SKILL_DIR, 'scripts'))
-
-from iotsdk_client import IoTClient
-from iotsdk_device import DeviceManager
-
-# Initialize client with app credentials
-client = IoTClient.from_credentials(
-    base_url="https://your-iot-platform-url",
-    app_id="your-app-id",
-    app_secret="your-app-secret"
-)
-
-# Create device manager
-device_manager = DeviceManager(client)
-
-# Perform operations...
-```
-
----
-
-## Operations
-
-### Authentication
-
-**Get Token from App Credentials**
-
-Endpoint: `/api/v1/oauth/auth`
-
-Request:
-```json
-{
-  "appId": "your-app-id",
-  "appSecret": "your-app-secret"
-}
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/oauth/auth" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "appKey": "'"${IOTAPI_APP_KEY}"'",
+    "appSecret": "'"${IOTAPI_APP_SECRET}"'"
+  }'
 ```
 
 Response:
 ```json
 {
-  "success": true,
   "code": 200,
-  "data": "token-string"
+  "success": true,
+  "data": "77e7368a-fe49-4bb7-8755-50756ebf26f4",
+  "errorMessage": ""
 }
 ```
 
-### Device Registration
+Extract the token from `data` field and use it in subsequent requests.
 
-**Register a new device**
+### API Call Pattern
 
-Method: `device_manager.register_device(product_key, device_name=None, nick_name=None)`
+**Important**: This platform uses a custom `token` header, NOT the standard `Authorization: Bearer` format.
 
-Parameters:
-- `product_key` (required): Product unique identifier
-- `device_name` (optional): Device identifier, auto-generated if not provided
-- `nick_name` (optional): Device display name
+```bash
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/{endpoint}" \
+  -H "Content-Type: application/json" \
+  -H "token: ${IOTAPI_TOKEN}" \
+  -d '{
+    "param1": "value1",
+    "param2": "value2"
+  }'
+```
 
-Returns:
+All requests are POST with JSON body. Responses follow this format:
+
 ```json
 {
+  "code": 200,
+  "success": true,
+  "data": { ... },
+  "errorMessage": ""
+}
+```
+
+- `code`: 200 = success, other values indicate errors
+- `success`: boolean indicating if request succeeded
+- `data`: response payload (structure varies by endpoint)
+- `errorMessage`: error description (empty on success)
+
+---
+
+## API Endpoints
+
+### Authentication
+
+#### Get Token
+**Endpoint**: `POST /api/v1/oauth/auth`
+
+**Parameters**:
+```json
+{
+  "appKey": "string",
+  "appSecret": "string"
+}
+```
+
+**Response**: Token string in `data` field (valid for 24 hours)
+
+---
+
+### Alarm APIs
+
+#### Query Alarm List
+**Endpoint**: `POST /api/v1/alarm/queryAlarmListAll`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `startTime` | string | No | Start time (ISO 8601 or timestamp) |
+| `endTime` | string | No | End time (ISO 8601 or timestamp) |
+| `status` | string | No | Alarm status: `Trigger`, `ManualRelieve`, `AutoRelieve` |
+
+**Response**: Array of alarm objects with fields:
+- `name`: Alarm name
+- `category`: Category (e.g., "Point")
+- `level`: Level (e.g., "Level1")
+- `generateValue`: Trigger value
+- `restoreValue`: Restore value
+- `restoreTime`: Restore timestamp
+- `status`: Current status
+- `device`: Device object
+- `createTime`: Creation timestamp
+
+---
+
+### Product APIs
+
+#### Create Product
+**Endpoint**: `POST /api/v1/product/create`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productName` | string | Yes | Product name |
+| `productKey` | string | No | Product key (auto-generated if not provided) |
+| `authType` | string | No | Auth type: `Default`, `Once`, `Dynamic` (default: `Default`) |
+| `productSecret` | string | No | Product secret (required for `Dynamic` auth, auto-generated otherwise) |
+
+#### Query Product Details
+**Endpoint**: `POST /api/v1/product/query`
+
+**Parameters**: Provide one of:
+- `productKey`: Product key
+- `productId`: Product ID
+
+#### Query All Products
+**Endpoint**: `POST /api/v1/product/queryListAll`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productName` | string | No | Product name (supports fuzzy search) |
+
+**Response**: Array of products with fields:
+- `productKey`: Product identifier
+- `productName`: Product name
+- `authType`: Authentication type
+- `productSecret`: Product secret
+- `deviceNumber`: Number of devices
+- `propertyNumber`: Number of properties
+- `eventNumber`: Number of events
+- `serviceNumber`: Number of services
+
+#### Delete Product
+**Endpoint**: `POST /api/v1/product/delete`
+
+**Parameters**: Provide one of:
+- `productKey`: Product key
+- `productId`: Product ID
+
+---
+
+### Device APIs
+
+#### Quick Register Device
+**Endpoint**: `POST /api/v1/quickdevice/register`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productKey` | string | Yes | Product key |
+| `deviceName` | string | No | Device code (auto-generated if not provided) |
+| `nickName` | string | No | Device nickname (defaults to deviceName) |
+
+#### Query Device Details
+**Endpoint**: `POST /api/v1/quickdevice/detail`
+
+**Parameters**: Provide one of:
+- `deviceName`: Device code
+- `deviceId`: Device ID
+
+**Response**: Device object with fields:
+- `deviceId`: Device unique ID
+- `deviceName`: Device code
+- `nickName`: Device nickname
+- `productKey`: Product key
+- `productName`: Product name
+- `deviceSecret`: Device secret
+- `status`: Device status (`ONLINE`, `OFFLINE`, `UNACTIVE`)
+- `ipAddress`: IP address
+- `activeTime`: Activation timestamp
+- `onlineTime`: Last online timestamp
+- `createTime`: Creation timestamp
+- `firmwareVersion`: Firmware version (if reported)
+
+#### Query Device Status
+**Endpoint**: `POST /api/v1/quickdevice/status`
+
+**Parameters**: Provide one of:
+- `deviceName`: Device code
+- `deviceId`: Device ID
+
+**Response**: Status string (`ONLINE`, `OFFLINE`, `UNACTIVE`)
+
+#### Batch Query Device State
+**Endpoint**: `POST /api/v1/quickdevice/batchGetDeviceState`
+
+**Parameters**: Provide one of (max 100 devices):
+- `deviceName`: Array of device codes
+- `deviceId`: Array of device IDs
+
+**Response**: Array of device state objects
+
+#### Batch Query Device Details
+**Endpoint**: `POST /api/v1/quickdevice/batchQueryDeviceDetail`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productKey` | string | Yes | Product key |
+| `deviceName` | array | No | Device codes (returns all if not provided) |
+
+#### Query Devices by Product
+**Endpoint**: `POST /api/v1/quickdevice/queryDevice`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productKey` | string | Yes | Product key |
+
+**Response**: Array of all devices under the product
+
+---
+
+### Thing Model APIs
+
+#### Query Thing Model
+**Endpoint**: `POST /api/v1/thing/queryThingModel`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productKey` | string | Yes | Product key |
+
+**Response**: Thing model definition with properties, events, and services
+
+#### Set Device Property
+**Endpoint**: `POST /api/v1/thing/setDevicesProperty`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `pointList` | array | Yes | Array of property objects: `[{"identifier": "prop1", "value": "val1"}]` |
+
+#### Batch Set Device Properties
+**Endpoint**: `POST /api/v1/thing/setBatchDevicesProperty`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | array | Yes | Array of device codes |
+| `pointList` | array | Yes | Array of property objects |
+
+#### Invoke Device Service
+**Endpoint**: `POST /api/v1/thing/invokeThingsService`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `servicePoint` | object | Yes | Service info: `{"identifier": "service_name"}` |
+| `pointList` | array | Yes | Service input parameters: `[{"identifier": "param1", "value": "val1"}]` |
+
+#### Batch Invoke Device Service
+**Endpoint**: `POST /api/v1/thing/invokeBatchThingsService`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | array | Yes | Array of device codes |
+| `servicePoint` | object | Yes | Service info |
+| `pointList` | array | Yes | Service input parameters |
+
+#### Query Device Property Data
+**Endpoint**: `POST /api/v1/thing/queryDevicePropertyData`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `identifier` | string | Yes | Property identifier |
+| `startTime` | string | Yes | Start time |
+| `endTime` | string | Yes | End time |
+| `downSampling` | string | No | Down-sampling interval (default: "1s") |
+
+#### Batch Query Device Properties Data
+**Endpoint**: `POST /api/v1/thing/queryDevicePropertiesData`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `identifier` | string | Yes | Comma-separated property identifiers |
+| `startTime` | string | Yes | Start time |
+| `endTime` | string | Yes | End time |
+| `downSampling` | string | No | Down-sampling interval (default: "1s") |
+
+#### Query Device Event Data
+**Endpoint**: `POST /api/v1/thing/queryDeviceEventData`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `identifier` | string | No | Event identifier (all events if not provided) |
+| `startTime` | string | Yes | Start time |
+| `endTime` | string | Yes | End time |
+
+#### Query Device Service Data
+**Endpoint**: `POST /api/v1/thing/queryDeviceServiceData`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `identifier` | string | No | Service identifier (all services if not provided) |
+| `startTime` | string | Yes | Start time |
+| `endTime` | string | Yes | End time |
+
+**Response**: Array of service call records with fields:
+- `send`: Sent content
+- `receive`: Response content
+- `receiveTime`: Response timestamp
+- `result`: Result
+- `resultTime`: Result timestamp
+- `servicePoint`: Service point info
+
+---
+
+### Custom Topic APIs
+
+For devices that don't use thing model, the platform supports custom topics for transparent message passing.
+
+**Topics**:
+- Subscribe (device receives): `/{productKey}/{deviceName}/user/get`
+- Publish (device sends): `/{productKey}/{deviceName}/user/update`
+- Error: `/{productKey}/{deviceName}/user/update/error`
+
+#### Send Custom Message to Device
+**Endpoint**: `POST /api/v1/device/down/record/add/custom`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `deviceName` | string | Yes | Device code |
+| `messageContent` | string | Yes | Base64-encoded message content |
+
+**Example**: To send binary Modbus command `01 03 00 00 00 01 84 0A`:
+```bash
+# Convert to Base64: AQMAAAABhAo=
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/device/down/record/add/custom" \
+  -H "Content-Type: application/json" \
+  -H "token: ${IOTAPI_TOKEN}" \
+  -d '{
+    "deviceName": "Wk9kOa5NLX",
+    "messageContent": "AQMAAAABhAo="
+  }'
+```
+
+---
+
+### RRPC (Synchronous MQTT Communication)
+
+RRPC enables synchronous request-response communication with devices over MQTT.
+
+**Device subscribes to**: `/sys/${productKey}/${deviceName}/rrpc/request/+`
+**Device responds to**: `/sys/${productKey}/${deviceName}/rrpc/response/${requestId}`
+
+#### Send RRPC Request
+**Endpoint**: `POST /api/v1/device/rrpc`
+
+**Parameters**:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `productKey` | string | Yes | Product key |
+| `deviceName` | string | Yes | Device code |
+| `requestBase64Byte` | string | Yes | Base64-encoded request message |
+| `timeout` | long | Yes | Timeout in milliseconds |
+
+**Response**:
+```json
+{
+  "code": 200,
   "success": true,
   "data": {
-    "deviceId": "device-id",
-    "deviceName": "device-name",
-    "deviceSecret": "device-secret",
-    "productKey": "product-key",
-    "nickName": "display-name"
+    "rrpcCode": "SUCCESS",  // or "TIMEOUT", "OFFLINE"
+    "payloadBase64Byte": "base64_encoded_response"
   }
 }
 ```
 
-### Device Details
+**RRPC Codes**:
+- `SUCCESS`: Device responded successfully
+- `TIMEOUT`: No response within timeout period
+- `OFFLINE`: Device is offline
 
-**Query device information**
-
-Method: `device_manager.get_device_detail(device_name=None, device_id=None)`
-
-Parameters (at least one required):
-- `device_name`: Device identifier
-- `device_id`: Device unique ID
-
-Returns:
-```json
-{
-  "success": true,
-  "data": {
-    "deviceId": "device-id",
-    "deviceName": "device-name",
-    "status": "ONLINE|OFFLINE|UNACTIVE",
-    "productKey": "product-key",
-    "nickName": "display-name"
-  }
-}
-```
-
-### Device Status
-
-**Query device online status**
-
-Method: `device_manager.get_device_status(device_name=None, device_id=None)`
-
-Parameters (at least one required):
-- `device_name`: Device identifier
-- `device_id`: Device unique ID
-
-Returns:
-```json
-{
-  "success": true,
-  "data": {
-    "status": "ONLINE|OFFLINE|UNACTIVE",
-    "timestamp": 1234567890000
-  }
-}
-```
-
-Status values:
-- `ONLINE`: Device is online (在线)
-- `OFFLINE`: Device is offline (离线)
-- `UNACTIVE`: Device not activated (未激活)
-
-### Batch Device Status
-
-**Query multiple devices status**
-
-Method: `device_manager.batch_get_device_status(device_name_list=None, device_id_list=None)`
-
-Parameters (at least one required):
-- `device_name_list`: List of device identifiers
-- `device_id_list`: List of device IDs
-
-Limitations:
-- Maximum 100 devices per request
-
-Returns:
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "deviceName": "device-1",
-      "deviceStatus": {
-        "status": "ONLINE",
-        "timestamp": 1234567890000
-      },
-      "lastOnlineTime": "2024-01-01 12:00:00"
-    }
-  ]
-}
-```
-
-### RRPC Messages
-
-**Send RRPC (Revert-RPC) message to device**
-
-Method: `device_manager.send_rrpc_message(device_name, product_key, message_content, timeout=5000)`
-
-Parameters:
-- `device_name` (required): Device identifier
-- `product_key` (required): Product unique identifier
-- `message_content` (required): Message content (string or JSON)
-- `timeout` (optional): Timeout in milliseconds, default 5000
-
-The SDK automatically handles base64 encoding/decoding.
-
-Returns:
-```json
-{
-  "success": true,
-  "payloadBase64Byte": "base64-encoded-response"
-}
-```
-
-### Custom Commands
-
-**Send custom command to device (async)**
-
-Endpoint: `/api/v1/device/down/record/add/custom`
-
-Parameters:
-- `deviceName`: Device identifier
-- `messageContent`: Base64-encoded message content
-
-Example:
-```python
-import base64
-import json
-
-message = json.dumps({
-    'command': 'set_mode',
-    'params': {'mode': 2, 'duration': 30}
-})
-
-payload = {
-    "deviceName": "your-device-name",
-    "messageContent": base64.b64encode(message.encode('utf-8')).decode('utf-8')
-}
-
-response = client._make_request("/api/v1/device/down/record/add/custom", payload)
-```
+**Note**: Platform automatically handles Base64 encoding/decoding. Device receives raw bytes and should respond with raw bytes.
 
 ---
 
@@ -303,10 +507,73 @@ response = client._make_request("/api/v1/device/down/record/add/custom", payload
 
 | Error | Solution |
 |-------|----------|
-| `401` | Invalid credentials — verify app_id/app_secret or token |
-| `403` | Insufficient permissions — check account privileges |
-| Connection error | Verify base_url is correct and platform is accessible |
-| `ValueError` | Missing required parameters — check device_name or device_id |
+| `401` | Invalid or expired token — obtain new token via `/api/v1/oauth/auth` |
+| `403` | Insufficient permissions — check appKey permissions configuration |
+| Connection refused | Verify `IOTAPI_BASE_URL` is correct and platform is accessible |
+| `code != 200` | Check `errorMessage` field in response for details |
+
+---
+
+## Best Practices
+
+### Workflow Patterns
+
+**1. Device Management Flow**:
+```
+Query products → Select product → Query devices → Get device details/status
+```
+
+**2. Device Control Flow**:
+```
+Query thing model → Identify properties/services → Set property or invoke service
+```
+
+**3. Data Query Flow**:
+```
+Get device list → Query property/event/service data for time range
+```
+
+### Performance Tips
+
+- Use batch APIs when operating on multiple devices (max 100 per request)
+- Query thing model once and cache the structure
+- Use parallel requests for independent operations
+- For real-time control, prefer RRPC over async property setting
+- Use custom topics for devices with proprietary protocols
+
+### Common Patterns
+
+**Check device online status before control**:
+```bash
+# 1. Check status
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/quickdevice/status" \
+  -H "Content-Type: application/json" \
+  -H "token: ${IOTAPI_TOKEN}" \
+  -d '{"deviceName": "sensor_001"}'
+
+# 2. If online, set property
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/thing/setDevicesProperty" \
+  -H "Content-Type: application/json" \
+  -H "token: ${IOTAPI_TOKEN}" \
+  -d '{
+    "deviceName": "sensor_001",
+    "pointList": [{"identifier": "temperature_threshold", "value": "25"}]
+  }'
+```
+
+**Query historical data with time range**:
+```bash
+curl -X POST "${IOTAPI_BASE_URL}/api/v1/thing/queryDevicePropertyData" \
+  -H "Content-Type: application/json" \
+  -H "token: ${IOTAPI_TOKEN}" \
+  -d '{
+    "deviceName": "sensor_001",
+    "identifier": "temperature",
+    "startTime": "2025-01-01T00:00:00.000Z",
+    "endTime": "2025-01-31T23:59:59.999Z",
+    "downSampling": "1h"
+  }'
+```
 
 ---
 
@@ -314,119 +581,10 @@ response = client._make_request("/api/v1/device/down/record/add/custom", payload
 
 | Limitation | Mitigation |
 |-----------|------------|
-| Batch query limited to 100 devices | Split large queries into multiple batches |
-| RRPC timeout default 5000ms | Adjust timeout parameter for slow devices |
-| Device status timestamp in milliseconds | Convert to seconds: `timestamp / 1000` |
+| Token expires after 24 hours | Store appKey/appSecret for auto-refresh, or regenerate token |
+| Batch operations limited to 100 devices | Split large operations into multiple requests |
+| Property/event data queries return paginated results | Use appropriate time ranges and down-sampling |
+| RRPC timeout is user-defined | Set reasonable timeout based on device response time (typically 5-10 seconds) |
+| Custom topic messages must be Base64 encoded | Use `base64` command or programming language libraries |
 
 ---
-
-## Usage Examples
-
-### Example 1: Register and Query Device
-
-```python
-import sys
-import os
-
-# Add skill scripts to path
-SKILL_DIR = "/path/to/iotapi/skill"
-sys.path.insert(0, os.path.join(SKILL_DIR, 'scripts'))
-
-from iotsdk_client import IoTClient
-from iotsdk_device import DeviceManager
-
-# Initialize
-client = IoTClient.from_credentials(
-    base_url="https://iot.example.com",
-    app_id="app123",
-    app_secret="secret456"
-)
-device_manager = DeviceManager(client)
-
-# Register device
-response = device_manager.register_device(
-    product_key="prod-key-001",
-    nick_name="Temperature Sensor 1"
-)
-
-if client.check_response(response):
-    device_name = response["data"]["deviceName"]
-    print(f"Device registered: {device_name}")
-
-    # Query status
-    status = device_manager.get_device_status(device_name=device_name)
-    if client.check_response(status):
-        print(f"Status: {status['data']['status']}")
-```
-
-### Example 2: Batch Query Devices
-
-```python
-# Query multiple devices
-devices = ["device-001", "device-002", "device-003"]
-response = device_manager.batch_get_device_status(device_name_list=devices)
-
-if client.check_response(response):
-    for device in response["data"]:
-        name = device["deviceName"]
-        status = device["deviceStatus"]["status"]
-        print(f"{name}: {status}")
-```
-
-### Example 3: Send RRPC Command
-
-```python
-import json
-
-# Send command to device
-command = json.dumps({"action": "read_temperature"})
-response = device_manager.send_rrpc_message(
-    device_name="device-001",
-    product_key="prod-key-001",
-    message_content=command,
-    timeout=3000
-)
-
-if client.check_response(response):
-    # Response is automatically decoded
-    print("Command sent successfully")
-```
-
----
-
-## Helper Scripts
-
-The `scripts/` directory contains helper utilities:
-
-- `iot_client.py`: Standalone client wrapper for quick operations
-- `batch_query.py`: Batch device status query with CSV export
-- `device_monitor.py`: Continuous device status monitoring
-
-### Usage Examples
-
-```bash
-# Register device
-python scripts/iot_client.py register --product-key prod-001 --nick-name "Sensor 1"
-
-# Query device status
-python scripts/iot_client.py status --device-name device-001
-
-# Batch query devices
-python scripts/batch_query.py --devices device-001 device-002 --format csv
-
-# Monitor devices
-python scripts/device_monitor.py --devices device-001 device-002 --interval 60
-```
-
-Use these scripts when available for simpler operations. Otherwise, use the Direct SDK Mode.
-
----
-
-## Best Practices
-
-1. **Credential Management**: Use environment variables or config file, never hardcode
-2. **Client Reuse**: Create client once and reuse across operations to avoid repeated authentication
-3. **Error Handling**: Always check `client.check_response(response)` before accessing data
-4. **Batch Operations**: Use batch queries when checking multiple devices to reduce API calls
-5. **Timeout Tuning**: Adjust RRPC timeout based on device response characteristics
-6. **Parallel Queries**: After authentication, fire multiple independent device queries in parallel
